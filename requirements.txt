@@ -1,0 +1,4 @@
+# Verified against these exact versions. Pipecat's API moves quickly, so the
+# pins matter — newer releases may rename things this demo relies on.
+pipecat-ai[local,silero,whisper,piper,ollama]==1.3.0
+pipecat-ai-flows==1.2.0
