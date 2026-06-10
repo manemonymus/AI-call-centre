@@ -3,7 +3,7 @@
 A fully **local** multi-agent voice demo for a home-services company. You talk
 into your microphone; a virtual receptionist greets you, figures out what you
 need, and hands you to the right specialist. Nothing leaves your machine — no
-phone line, no cloud APIs, no keys
+phone line, no cloud APIs, no keys.
 
 ```
   Microphone / speakers   ->  LocalAudioTransport
