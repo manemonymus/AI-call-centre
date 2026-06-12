@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Downloaded models (Piper voices, ~60-115 MB each)
+*.onnx
+*.onnx.json
+
+# Runtime data
+chroma_db/
+call_logs/
+callcenter.db
+
+# Local env
+.env

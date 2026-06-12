@@ -1,4 +1,16 @@
 # Verified against these exact versions. Pipecat's API moves quickly, so the
 # pins matter — newer releases may rename things this demo relies on.
-pipecat-ai[local,silero,whisper,piper,ollama]==1.3.0
+pipecat-ai[local,silero,whisper,piper]==1.3.0
 pipecat-ai-flows==1.2.0
+
+# pipecat 1.3.0 imports `websockets` in its core, but a minimal install with no
+# websocket transport doesn't pull it in — so require it explicitly.
+websockets
+
+# RAG knowledge base (run: ollama pull nomic-embed-text, then: python ingest.py)
+chromadb
+ollama         # required by chromadb's OllamaEmbeddingFunction in v1.5+
+
+# Phone server (Twilio + ngrok)
+fastapi
+uvicorn[standard]
