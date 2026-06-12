@@ -87,6 +87,26 @@ The **first run downloads** the Whisper model and six Piper voices (~400 MB
 total, one time). After that, the assistant greets you and you can start
 talking — in English or Spanish. Press **Ctrl+C** to quit.
 
+## Upgrade the ears + brain (Deepgram + Claude)
+
+The free local stack trades accuracy and speed for $0. When Whisper mishears
+you or Ollama takes 10+ seconds to answer, switch to the hosted stack — same
+code, two API keys:
+
+```bash
+cp .env.example .env     # then edit .env:
+#   STT_PROVIDER=deepgram   + DEEPGRAM_API_KEY   (console.deepgram.com — free credit on signup)
+#   LLM_PROVIDER=anthropic  + ANTHROPIC_API_KEY  (console.anthropic.com)
+python bot.py
+```
+
+What it buys: phone-grade streaming transcription with proper Spanish
+code-switching (Deepgram Nova-3 multilingual, ~$0.006/min), ~1s responses and
+far more reliable routing/booking tool calls (Claude Haiku 4.5,
+~$0.005–0.015/min). Caller audio is kept out of Deepgram's training data by
+default (`DEEPGRAM_MIP_OPT_OUT=true`). TTS stays on free local Piper either
+way; mix and match providers freely.
+
 ## Run (real phone number via Twilio)
 
 ```bash

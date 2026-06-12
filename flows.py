@@ -59,22 +59,33 @@ OPENING_GREETING = (
     "systems. You can speak English or Spanish. How can I help you today?"
 )
 
+# First-contact greetings ask for the account phone number; once we already
+# know the caller (a lookup happened earlier in the call), the {name} variants
+# are used instead so departments never re-ask for what the caller gave.
 GREETINGS: dict[str, dict[str, str]] = {
     "billing": {
         "en": "You've reached billing! To get started, what's the best phone number on your account?",
         "es": "¡Le atiende el departamento de facturación! Para empezar, ¿cuál es el número de teléfono de su cuenta?",
+        "en_known": "You've reached billing! How can I help{name}?",
+        "es_known": "¡Le atiende el departamento de facturación! ¿En qué puedo ayudarle{name}?",
     },
     "scheduling": {
         "en": "You've reached scheduling! I can help you book, reschedule, or cancel a visit. What's the best phone number on your account?",
         "es": "¡Le atiende el departamento de citas! Puedo ayudarle a reservar, cambiar o cancelar una visita. ¿Cuál es el número de teléfono de su cuenta?",
+        "en_known": "You've reached scheduling! Would you like to book, reschedule, or cancel a visit{name}?",
+        "es_known": "¡Le atiende el departamento de citas! ¿Desea reservar, cambiar o cancelar una visita{name}?",
     },
     "customer_service": {
         "en": "You've reached our customer care team! I'm here to help — what's the best phone number on your account?",
         "es": "¡Le atiende nuestro equipo de atención al cliente! Estoy aquí para ayudarle. ¿Cuál es el número de teléfono de su cuenta?",
+        "en_known": "You've reached our customer care team! What can I do for you{name}?",
+        "es_known": "¡Le atiende nuestro equipo de atención al cliente! ¿Qué puedo hacer por usted{name}?",
     },
     "escalation": {
         "en": "I'm sorry for the trouble. I'll take down your details and have a member of our team call you back. Could I get your name and the best number to reach you?",
         "es": "Lamento las molestias. Tomaré sus datos para que un miembro de nuestro equipo le devuelva la llamada. ¿Me puede dar su nombre y el mejor número para contactarle?",
+        "en_known": "I'm sorry for the trouble{name}. I'll take down the details and have a member of our team call you back. What should they know?",
+        "es_known": "Lamento las molestias{name}. Tomaré los detalles para que un miembro de nuestro equipo le devuelva la llamada. ¿Qué deben saber?",
     },
 }
 
@@ -88,6 +99,9 @@ VOICE_STYLE = (
     "lookups, or internal steps. Respond in the language the caller is currently "
     "speaking — English or Spanish. If the caller asks whether you are a robot, "
     "an AI, or a human, answer truthfully that you are an AI assistant. Never "
+    "ask for information the caller already gave earlier in this call — their "
+    "name, phone number, and looked-up account details stay valid across "
+    "department transfers. Never "
     "state a price, fee, policy, or promise that you have not retrieved from the "
     "knowledge base or the caller's record — if you don't know, say a team "
     "member will follow up. If the caller is angry, asks for a human, or you "
@@ -375,11 +389,25 @@ async def _switch_voice_and_greet(
     language = "en"
     if voices:
         language = voices.language
-        frames.append(
-            ManuallySwitchServiceFrame(service=voices.set_department(department))
+        service = voices.set_department(department)
+        frames.append(ManuallySwitchServiceFrame(service=service))
+        _log(
+            flow_manager,
+            "voice_switch",
+            department=department,
+            voice=voices.voice_map.get((department, language), "?"),
         )
-    greeting = GREETINGS.get(greeting_key, {}).get(language)
+
+    # Once we know who's calling, stop asking for the phone number on every
+    # transfer — greet them (by name when we have it) and get on with it.
+    customer = flow_manager.state.get("customer") or {}
+    known = bool(customer.get("found") or flow_manager.state.get("phone"))
+    variant = f"{language}_known" if known else language
+    greeting = GREETINGS.get(greeting_key, {}).get(variant)
     if greeting:
+        first_name = str(customer.get("customer_name", "")).split(" ")[0]
+        name = f", {first_name}" if first_name else ""
+        greeting = greeting.format(name=name)
         frames.append(TTSSpeakFrame(greeting))
     if frames:
         await flow_manager.worker.queue_frames(frames)
@@ -506,8 +534,11 @@ def create_billing_node() -> NodeConfig:
             {
                 "role": "system",
                 "content": (
-                    "The caller has just been greeted and asked for their phone "
-                    "number. Once you have it, call lookup_customer. Use their name "
+                    "If this conversation does not already contain the caller's "
+                    "account record, they were just asked for their phone number — "
+                    "once you have it, call lookup_customer (once per call). If "
+                    "their record is already in the conversation from an earlier "
+                    "lookup, do NOT ask again. Use their name "
                     "and history naturally. Only state amounts, dates, or charges "
                     "you actually find in their record or the knowledge base; if "
                     "you don't have a detail, say you'll look into it rather than "
@@ -537,8 +568,10 @@ def create_scheduling_node() -> NodeConfig:
                 "content": (
                     f"Today is {datetime.now():%A, %B %d, %Y} "
                     f"({datetime.now():%Y-%m-%d}). "
-                    "The caller has just been greeted and asked for their phone "
-                    "number. Once you have it, call lookup_customer. To book: call "
+                    "If this conversation does not already contain the caller's "
+                    "account record, they were just asked for their phone number — "
+                    "once you have it, call lookup_customer (once per call). If "
+                    "their record is already there, do NOT ask again. To book: call "
                     "check_availability and offer two or three of the returned "
                     "times conversationally — never offer a time it didn't return. "
                     "Before booking, read the full details back (day, time, "
@@ -581,8 +614,10 @@ def create_cs_node() -> NodeConfig:
             {
                 "role": "system",
                 "content": (
-                    "The caller has just been greeted and asked for their phone "
-                    "number. Once you have it, call lookup_customer and pay "
+                    "If this conversation does not already contain the caller's "
+                    "account record, they were just asked for their phone number — "
+                    "once you have it, call lookup_customer (once per call). If "
+                    "their record is already there, do NOT ask again. Pay "
                     "attention to their service history and last call notes. Get a "
                     "brief, clear picture of the issue with a short follow-up "
                     "question if needed. For complaints, acknowledge and apologize "

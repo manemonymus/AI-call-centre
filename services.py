@@ -30,6 +30,14 @@ import os
 import numpy as np
 from loguru import logger
 
+# Load API keys etc. from a .env file in the project directory, if present.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
@@ -59,15 +67,18 @@ from calllog import CallLogger
 DEPARTMENTS = ("router", "billing", "scheduling", "customer_service")
 LANGUAGES = ("en", "es")
 
+# Cast for maximum audible contrast on the common transfer paths: the router
+# is male, so billing and customer care are female; scheduling (male) still
+# contrasts with the router's timbre. Adjacent departments alternate gender.
 DEFAULT_VOICES: dict[tuple[str, str], str] = {
-    ("router", "en"): "en_US-lessac-medium",
-    ("billing", "en"): "en_US-ryan-medium",
-    ("scheduling", "en"): "en_US-amy-medium",
-    ("customer_service", "en"): "en_US-hfc_female-medium",
-    ("router", "es"): "es_ES-davefx-medium",
-    ("billing", "es"): "es_ES-davefx-medium",
-    ("scheduling", "es"): "es_MX-claude-high",
-    ("customer_service", "es"): "es_MX-claude-high",
+    ("router", "en"): "en_US-lessac-medium",        # male, neutral
+    ("billing", "en"): "en_US-hfc_female-medium",   # female, warm
+    ("scheduling", "en"): "en_US-ryan-medium",      # male, deeper
+    ("customer_service", "en"): "en_US-amy-medium", # female, brighter
+    ("router", "es"): "es_ES-davefx-medium",        # male
+    ("billing", "es"): "es_MX-claude-high",         # female
+    ("scheduling", "es"): "es_ES-davefx-medium",    # male
+    ("customer_service", "es"): "es_MX-claude-high",# female
 }
 
 
@@ -291,12 +302,27 @@ def build_stt():
             from pipecat.services.deepgram.stt import DeepgramSTTService
         except ImportError as e:
             raise ImportError(
-                "Deepgram STT needs: pip install 'pipecat-ai[deepgram]' and DEEPGRAM_API_KEY. "
-                "Remember to send mip_opt_out=true if you don't want audio used for training."
+                "Deepgram STT needs: pip install 'pipecat-ai[deepgram]' and DEEPGRAM_API_KEY."
             ) from e
+        api_key = os.getenv("DEEPGRAM_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "STT_PROVIDER=deepgram but DEEPGRAM_API_KEY is not set. "
+                "Get a key (with free credit) at console.deepgram.com and put it in .env"
+            )
+        # language="multi" enables code-switching across 10 languages (incl.
+        # Spanish) and tags each TranscriptionFrame with the detected language
+        # — LanguageRouter consumes those tags exactly like local Whisper's.
+        # mip_opt_out keeps caller audio out of Deepgram's training data
+        # (privacy-first default; opting out forfeits their discounted rates).
         return DeepgramSTTService(
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-            settings=DeepgramSTTService.Settings(language="multi"),
+            api_key=api_key,
+            mip_opt_out=os.getenv("DEEPGRAM_MIP_OPT_OUT", "true").lower() == "true",
+            settings=DeepgramSTTService.Settings(
+                model=os.getenv("DEEPGRAM_MODEL", "nova-3-general"),
+                language="multi",
+                smart_format=True,
+            ),
         )
     raise ValueError(f"Unknown STT_PROVIDER '{provider}'")
 
@@ -323,8 +349,14 @@ def build_llm():
             raise ImportError(
                 "Anthropic LLM needs: pip install 'pipecat-ai[anthropic]' and ANTHROPIC_API_KEY."
             ) from e
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set. "
+                "Get a key at console.anthropic.com and put it in .env"
+            )
         return AnthropicLLMService(
-            api_key=os.environ["ANTHROPIC_API_KEY"],
+            api_key=api_key,
             settings=AnthropicLLMService.Settings(
                 model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
             ),
