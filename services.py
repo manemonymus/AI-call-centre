@@ -64,21 +64,23 @@ from calllog import CallLogger
 # Override any entry with e.g. VOICE_BILLING_EN=en_US-joe-medium.
 # Voices auto-download (~60 MB each) on first run.
 # ---------------------------------------------------------------------------
-DEPARTMENTS = ("router", "billing", "scheduling", "customer_service")
+DEPARTMENTS = ("router", "leave", "conduct", "compliance", "general")
 LANGUAGES = ("en", "es")
 
-# Cast for maximum audible contrast on the common transfer paths: the router
-# is male, so billing and customer care are female; scheduling (male) still
-# contrasts with the router's timbre. Adjacent departments alternate gender.
+# A distinct voice per HR department, alternating gender on the common transfer
+# paths so each handoff is clearly audible. Spanish alternates davefx (male) /
+# claude (female) to match.
 DEFAULT_VOICES: dict[tuple[str, str], str] = {
-    ("router", "en"): "en_US-lessac-medium",        # male, neutral
-    ("billing", "en"): "en_US-hfc_female-medium",   # female, warm
-    ("scheduling", "en"): "en_US-ryan-medium",      # male, deeper
-    ("customer_service", "en"): "en_US-amy-medium", # female, brighter
+    ("router", "en"): "en_US-lessac-medium",        # male, neutral receptionist
+    ("leave", "en"): "en_US-hfc_female-medium",     # female, warm
+    ("conduct", "en"): "en_US-ryan-medium",         # male, measured
+    ("compliance", "en"): "en_US-amy-medium",       # female, precise
+    ("general", "en"): "en_US-joe-medium",          # male, friendly
     ("router", "es"): "es_ES-davefx-medium",        # male
-    ("billing", "es"): "es_MX-claude-high",         # female
-    ("scheduling", "es"): "es_ES-davefx-medium",    # male
-    ("customer_service", "es"): "es_MX-claude-high",# female
+    ("leave", "es"): "es_MX-claude-high",           # female
+    ("conduct", "es"): "es_ES-davefx-medium",       # male
+    ("compliance", "es"): "es_MX-claude-high",      # female
+    ("general", "es"): "es_ES-davefx-medium",       # male
 }
 
 

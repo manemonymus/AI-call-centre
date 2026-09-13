@@ -72,13 +72,13 @@ async def main():
     await worker.queue_frames([TTSSpeakFrame("Hello from the router voice.")])
     await asyncio.sleep(4)
 
-    # Simulate the billing transfer exactly as the LLM tool call would do it
-    result, node = await flows.ROUTE_BILLING.handler({}, fm)
+    # Simulate the leave-team transfer exactly as the LLM tool call would do it
+    result, node = await flows.ROUTE_LEAVE.handler({}, fm)
     await fm.set_node_from_config(node)
     await asyncio.sleep(6)
 
-    # One more line — should still be the billing voice
-    await worker.queue_frames([TTSSpeakFrame("Still the billing voice?")])
+    # One more line — should still be the leave-team voice
+    await worker.queue_frames([TTSSpeakFrame("Still the leave team voice?")])
     await asyncio.sleep(4)
 
     await worker.queue_frames([EndFrame()])
@@ -88,9 +88,9 @@ async def main():
     for line in SYNTH_LOG:
         print(" ", line[:120])
     router_svc = voices.service_for("router", "en")
-    billing_svc = voices.service_for("billing", "en")
-    print(f"\nrouter voice service:  {router_svc}")
-    print(f"billing voice service: {billing_svc}")
+    leave_svc = voices.service_for("leave", "en")
+    print(f"\nrouter voice service: {router_svc}")
+    print(f"leave voice service:  {leave_svc}")
     print(f"directory now points at: {voices.current_service()} (dept={voices.department})")
 
 

@@ -1,20 +1,27 @@
 """
-Shared multi-agent flow for the call center (used by both bot.py and server.py).
+Shared multi-agent flow for the HR employee helpline (bot.py and server.py).
 
-Agents are Pipecat Flows nodes: Router -> Billing | Scheduling | Customer
-Service, plus an Escalation node (human callback tickets) and an End node.
-Each department has its own AI voice per language; transfers switch the
-active voice and speak a greeting in the caller's current language.
+Employees call in; a receptionist routes them to one of four HR departments,
+each with its OWN AI voice and its OWN knowledge base (per-department RAG):
 
-What's real here (no faking):
-  - Bookings hit a local SQLite calendar (booking.py) with availability and
-    double-booking protection.
-  - Escalations create tickets a human can work later.
-  - The bot is instructed to never invent prices/policies (RAG-grounded),
-    to read bookings back before committing, and to answer truthfully that
-    it is an AI.
+    Reception ─┬─ Leave & Time-Off      (hr_leave KB)
+               ├─ Conduct & Ethics      (hr_conduct KB)
+               ├─ Compliance & Reporting(hr_compliance KB)
+               └─ HR Policy & General    (hr_general KB)
+    + Escalation (human HR callback ticket)  + End
 
-Expected flow_manager.state entries (set by the caller before initialize()):
+Each department answers ONLY from its own knowledge base (rag.make_search_tool),
+so departments don't cross-contaminate. The data is real HR policy Q&A — build
+it with `python fetch_hr_data.py` then `python ingest.py`.
+
+What's grounded/real:
+  - Answers come from the department's RAG knowledge base; agents are told
+    never to invent policies, numbers, or rules not retrieved.
+  - Escalations create real callback tickets (booking.create_ticket).
+  - Employee lookup (employees.csv) lets agents greet by name and skip
+    re-asking once identity is known.
+
+Expected flow_manager.state entries (set before initialize()):
     state["voices"] = services.VoiceDirectory
     state["log"]    = calllog.CallLogger (optional)
 """
@@ -24,7 +31,6 @@ from __future__ import annotations
 import csv
 import os
 import re
-from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
@@ -34,58 +40,67 @@ from pipecat_flows import FlowArgs, FlowManager, FlowsFunctionSchema, NodeConfig
 
 import booking
 
-# RAG knowledge base — enabled once you run: python ingest.py
-# Set ENABLE_RAG=false to switch it off. Falls back gracefully if missing.
-SEARCH_KB_TOOL = None
-if os.getenv("ENABLE_RAG", "true").lower() == "true":
+# Per-department knowledge-base search tools. Disabled gracefully if chromadb
+# isn't installed; set ENABLE_RAG=false to turn off.
+_RAG = os.getenv("ENABLE_RAG", "true").lower() == "true"
+if _RAG:
     try:
-        from rag import SEARCH_KB_TOOL
+        from rag import make_search_tool
     except ImportError:
         logger.warning("RAG disabled: chromadb not installed or rag.py not found.")
+        _RAG = False
+if not _RAG:
+    def make_search_tool(_department):  # type: ignore
+        return None
 
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Hearthstone Home Services")
-CUSTOMERS_CSV = Path(__file__).parent / "customers.csv"
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Hearthstone")
+EMPLOYEES_CSV = Path(__file__).parent / "employees.csv"
 
 # ---------------------------------------------------------------------------
-# Opening greeting (spoken by the deterministic TTSSpeakFrame at call start).
-# Includes the AI + recording disclosure: California B.O.T. Act / Utah AIPA
-# safe harbors, all-party-consent recording states, EU AI Act Art. 50.
-# The Spanish-language disclosure is replayed by LanguageRouter the first
-# time a caller switches to Spanish.
+# Opening greeting — spoken at call start by a deterministic TTSSpeakFrame.
+# Includes the AI + recording disclosure (California B.O.T. Act / Utah AIPA
+# safe harbors, all-party recording consent, EU AI Act Art. 50). The Spanish
+# disclosure is replayed by LanguageRouter the first time a caller switches.
 # ---------------------------------------------------------------------------
 OPENING_GREETING = (
-    f"Thanks for calling {COMPANY_NAME}! Just so you know, I'm an automated "
-    "A.I. assistant, and this call may be recorded and transcribed by automated "
-    "systems. You can speak English or Spanish. How can I help you today?"
+    f"Thanks for calling the {COMPANY_NAME} HR help line! Just so you know, I'm "
+    "an automated A.I. assistant, and this call may be recorded and transcribed "
+    "by automated systems. You can speak English or Spanish. What can I help you "
+    "with today?"
 )
 
-# First-contact greetings ask for the account phone number; once we already
-# know the caller (a lookup happened earlier in the call), the {name} variants
-# are used instead so departments never re-ask for what the caller gave.
+# First-contact greetings ask for the employee ID / phone; once we know the
+# caller, the *_known variants greet by name and skip re-asking.
 GREETINGS: dict[str, dict[str, str]] = {
-    "billing": {
-        "en": "You've reached billing! To get started, what's the best phone number on your account?",
-        "es": "¡Le atiende el departamento de facturación! Para empezar, ¿cuál es el número de teléfono de su cuenta?",
-        "en_known": "You've reached billing! How can I help{name}?",
-        "es_known": "¡Le atiende el departamento de facturación! ¿En qué puedo ayudarle{name}?",
+    "leave": {
+        "en": "You've reached the leave and time-off team! What's your employee ID or the phone number on file?",
+        "es": "¡Le atiende el equipo de permisos y ausencias! ¿Cuál es su número de empleado o el teléfono registrado?",
+        "en_known": "You've reached the leave and time-off team! What would you like to know{name}?",
+        "es_known": "¡Le atiende el equipo de permisos y ausencias! ¿Qué desea saber{name}?",
     },
-    "scheduling": {
-        "en": "You've reached scheduling! I can help you book, reschedule, or cancel a visit. What's the best phone number on your account?",
-        "es": "¡Le atiende el departamento de citas! Puedo ayudarle a reservar, cambiar o cancelar una visita. ¿Cuál es el número de teléfono de su cuenta?",
-        "en_known": "You've reached scheduling! Would you like to book, reschedule, or cancel a visit{name}?",
-        "es_known": "¡Le atiende el departamento de citas! ¿Desea reservar, cambiar o cancelar una visita{name}?",
+    "conduct": {
+        "en": "You've reached the conduct and ethics team! What's your employee ID or the phone number on file?",
+        "es": "¡Le atiende el equipo de conducta y ética! ¿Cuál es su número de empleado o el teléfono registrado?",
+        "en_known": "You've reached the conduct and ethics team! How can I help{name}?",
+        "es_known": "¡Le atiende el equipo de conducta y ética! ¿En qué puedo ayudarle{name}?",
     },
-    "customer_service": {
-        "en": "You've reached our customer care team! I'm here to help — what's the best phone number on your account?",
-        "es": "¡Le atiende nuestro equipo de atención al cliente! Estoy aquí para ayudarle. ¿Cuál es el número de teléfono de su cuenta?",
-        "en_known": "You've reached our customer care team! What can I do for you{name}?",
-        "es_known": "¡Le atiende nuestro equipo de atención al cliente! ¿Qué puedo hacer por usted{name}?",
+    "compliance": {
+        "en": "You've reached compliance and reporting! What's your employee ID or the phone number on file?",
+        "es": "¡Le atiende el equipo de cumplimiento! ¿Cuál es su número de empleado o el teléfono registrado?",
+        "en_known": "You've reached compliance and reporting! What can I do for you{name}?",
+        "es_known": "¡Le atiende el equipo de cumplimiento! ¿Qué puedo hacer por usted{name}?",
+    },
+    "general": {
+        "en": "You've reached general HR! What's your employee ID or the phone number on file?",
+        "es": "¡Le atiende recursos humanos! ¿Cuál es su número de empleado o el teléfono registrado?",
+        "en_known": "You've reached general HR! What's your question{name}?",
+        "es_known": "¡Le atiende recursos humanos! ¿Cuál es su pregunta{name}?",
     },
     "escalation": {
-        "en": "I'm sorry for the trouble. I'll take down your details and have a member of our team call you back. Could I get your name and the best number to reach you?",
-        "es": "Lamento las molestias. Tomaré sus datos para que un miembro de nuestro equipo le devuelva la llamada. ¿Me puede dar su nombre y el mejor número para contactarle?",
-        "en_known": "I'm sorry for the trouble{name}. I'll take down the details and have a member of our team call you back. What should they know?",
-        "es_known": "Lamento las molestias{name}. Tomaré los detalles para que un miembro de nuestro equipo le devuelva la llamada. ¿Qué deben saber?",
+        "en": "I'll take down your details and have someone from HR call you back. What should they know?",
+        "es": "Tomaré sus datos para que alguien de recursos humanos le devuelva la llamada. ¿Qué deben saber?",
+        "en_known": "I'll have someone from HR call you back{name}. What should they know?",
+        "es_known": "Haré que alguien de recursos humanos le devuelva la llamada{name}. ¿Qué deben saber?",
     },
 }
 
@@ -100,42 +115,47 @@ VOICE_STYLE = (
     "speaking — English or Spanish. If the caller asks whether you are a robot, "
     "an AI, or a human, answer truthfully that you are an AI assistant. Never "
     "ask for information the caller already gave earlier in this call — their "
-    "name, phone number, and looked-up account details stay valid across "
-    "department transfers. Never "
-    "state a price, fee, policy, or promise that you have not retrieved from the "
-    "knowledge base or the caller's record — if you don't know, say a team "
-    "member will follow up. If the caller is angry, asks for a human, or you "
-    "cannot help after two attempts, use the route_to_human function."
+    "name, employee ID, and looked-up details stay valid across department "
+    "transfers. You handle HR policy questions ONLY: never give legal, medical, "
+    "or financial advice, and never state a policy, number, deadline, or rule "
+    "that you did not get from search_knowledge_base or the caller's record. If "
+    "you don't find it, say an HR specialist will follow up. For personal "
+    "disputes, complaints about a person, or anything sensitive the knowledge "
+    "base can't resolve, use route_to_human."
 )
 
 
 # ---------------------------------------------------------------------------
-# Customer lookup (customers.csv).
+# Employee lookup (employees.csv).
 # ---------------------------------------------------------------------------
 def _digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
 
 
-def _load_customers() -> list[dict]:
-    if not CUSTOMERS_CSV.exists():
-        logger.warning(f"No customer file at {CUSTOMERS_CSV}; lookups will miss.")
+def _load_employees() -> list[dict]:
+    if not EMPLOYEES_CSV.exists():
+        logger.warning(f"No employee file at {EMPLOYEES_CSV}; lookups will miss.")
         return []
-    with open(CUSTOMERS_CSV, newline="", encoding="utf-8") as f:
+    with open(EMPLOYEES_CSV, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
-CUSTOMERS = _load_customers()
+EMPLOYEES = _load_employees()
 
 
-def _find_customer(phone: str) -> dict | None:
-    query = _digits(phone)
+def _find_employee(identifier: str) -> dict | None:
+    """Match by employee ID (e.g. E1042) or by phone number (format-agnostic)."""
+    ident = (identifier or "").strip().lower()
+    if ident:
+        for row in EMPLOYEES:
+            if row.get("employee_id", "").strip().lower() == ident:
+                return row
+    query = _digits(identifier)
     if not query:
         return None
-    for row in CUSTOMERS:
+    for row in EMPLOYEES:
         stored = _digits(row.get("phone_number", ""))
-        if not stored:
-            continue
-        if (
+        if stored and (
             stored[-10:] == query[-10:]
             or stored.endswith(query)
             or query.endswith(stored)
@@ -144,197 +164,60 @@ def _find_customer(phone: str) -> dict | None:
     return None
 
 
-async def lookup_customer(args: FlowArgs, flow_manager: FlowManager):
-    phone = str(args.get("phone_number", ""))
-    record = _find_customer(phone)
+async def lookup_employee(args: FlowArgs, flow_manager: FlowManager):
+    identifier = str(args.get("identifier", ""))
+    record = _find_employee(identifier)
     if record:
         result = {
             "found": True,
-            "customer_name": record.get("customer_name", ""),
-            "service_address": record.get("service_address", ""),
-            "service_history": record.get("service_history", ""),
-            "last_call_notes": record.get("last_call_notes", ""),
+            "employee_name": record.get("employee_name", ""),
+            "employee_id": record.get("employee_id", ""),
+            "job_title": record.get("job_title", ""),
+            "department": record.get("department", ""),
+            "hire_date": record.get("hire_date", ""),
+            "manager": record.get("manager", ""),
         }
-        flow_manager.state["customer"] = result
-        flow_manager.state["phone"] = booking.normalize_phone(phone)
-        logger.info(f"lookup_customer: matched {result['customer_name']}")
+        flow_manager.state["employee"] = result
+        flow_manager.state["phone"] = booking.normalize_phone(
+            record.get("phone_number", "")
+        )
+        logger.info(f"lookup_employee: matched {result['employee_name']}")
     else:
         result = {"found": False}
-        flow_manager.state["phone"] = booking.normalize_phone(phone)
-    _log(flow_manager, "tool", name="lookup_customer", found=result["found"])
+    _log(flow_manager, "tool", name="lookup_employee", found=result["found"])
     return result, None
 
 
 LOOKUP_TOOL = FlowsFunctionSchema(
-    name="lookup_customer",
+    name="lookup_employee",
     description=(
-        "Look up an existing customer in the database by phone number. Call this "
-        "once, as early as possible, using the phone number on the caller's "
-        "account. Returns the customer's name, address, service history, and last "
-        "call notes, or found=false if there is no matching record."
+        "Look up the caller in the employee directory by their employee ID "
+        "(e.g. E1042) or phone number. Call this once, early, to greet them by "
+        "name and tailor answers. Returns name, title, department, hire date, "
+        "and manager, or found=false if there's no match."
     ),
     properties={
-        "phone_number": {
+        "identifier": {
             "type": "string",
-            "description": "The caller's phone number, digits only or formatted.",
+            "description": "The caller's employee ID or phone number.",
         }
     },
-    required=["phone_number"],
-    handler=lookup_customer,
+    required=["identifier"],
+    handler=lookup_employee,
 )
 
 
 # ---------------------------------------------------------------------------
-# Booking tools (real SQLite calendar — see booking.py).
-# ---------------------------------------------------------------------------
-async def check_availability(args: FlowArgs, flow_manager: FlowManager):
-    date = args.get("date") or None
-    if date:
-        problem = booking.date_problem(str(date))
-        if problem:
-            _log(flow_manager, "tool", name="check_availability", date=date, problem=problem)
-            return {
-                "available": False,
-                "note": problem,
-                "alternatives": booking.available_slots(),
-            }, None
-    slots = booking.available_slots(date_str=date)
-    _log(flow_manager, "tool", name="check_availability", date=date, count=len(slots))
-    if not slots:
-        return {
-            "available": False,
-            "note": "No open slots on that day." if date else "No open slots in that window.",
-            "alternatives": booking.available_slots() if date else [],
-        }, None
-    return {"available": True, "slots": slots}, None
-
-
-CHECK_AVAILABILITY_TOOL = FlowsFunctionSchema(
-    name="check_availability",
-    description=(
-        "Get open appointment slots. Call this before offering any times — only "
-        "offer times this function returns. Optionally pass a specific date."
-    ),
-    properties={
-        "date": {
-            "type": "string",
-            "description": "Optional specific day to check, formatted YYYY-MM-DD.",
-        }
-    },
-    required=[],
-    handler=check_availability,
-)
-
-
-async def book_appointment(args: FlowArgs, flow_manager: FlowManager):
-    result = booking.book(
-        phone=str(args.get("phone_number") or flow_manager.state.get("phone", "")),
-        customer_name=str(args.get("customer_name", "")),
-        service=str(args.get("service", "")),
-        slot_str=str(args.get("slot", "")),
-        address=str(args.get("address", "")),
-        notes=str(args.get("notes", "")),
-    )
-    _log(flow_manager, "tool", name="book_appointment", **result)
-    return result, None
-
-
-BOOK_TOOL = FlowsFunctionSchema(
-    name="book_appointment",
-    description=(
-        "Book a technician visit in the real calendar. Only call this AFTER you "
-        "have read the day, time, and service back to the caller and they have "
-        "explicitly confirmed. Use a slot returned by check_availability."
-    ),
-    properties={
-        "phone_number": {"type": "string", "description": "Caller's phone number."},
-        "customer_name": {"type": "string", "description": "Caller's name."},
-        "service": {
-            "type": "string",
-            "description": "Short description of the service needed, e.g. 'HVAC tune-up'.",
-        },
-        "slot": {
-            "type": "string",
-            "description": "The chosen slot, formatted YYYY-MM-DD HH:MM (24-hour).",
-        },
-        "address": {"type": "string", "description": "Service address, if known."},
-        "notes": {"type": "string", "description": "Any extra notes."},
-    },
-    required=["phone_number", "customer_name", "service", "slot"],
-    handler=book_appointment,
-)
-
-
-async def list_appointments(args: FlowArgs, flow_manager: FlowManager):
-    phone = str(args.get("phone_number") or flow_manager.state.get("phone", ""))
-    appointments = [
-        {
-            "appointment_id": a["id"],
-            "slot": a["slot"],
-            "label": a["label"],
-            "service": a["service"],
-        }
-        for a in booking.upcoming_for_phone(phone)
-    ]
-    _log(flow_manager, "tool", name="list_appointments", count=len(appointments))
-    return {"appointments": appointments}, None
-
-
-LIST_APPOINTMENTS_TOOL = FlowsFunctionSchema(
-    name="list_appointments",
-    description=(
-        "List the caller's upcoming appointments with their ids. Use this before "
-        "canceling or rescheduling so you act on the right appointment."
-    ),
-    properties={
-        "phone_number": {"type": "string", "description": "Caller's phone number."}
-    },
-    required=["phone_number"],
-    handler=list_appointments,
-)
-
-
-async def cancel_appointment(args: FlowArgs, flow_manager: FlowManager):
-    phone = str(args.get("phone_number") or flow_manager.state.get("phone", ""))
-    appointment_id = args.get("appointment_id")
-    try:
-        appointment_id = int(appointment_id) if appointment_id is not None else None
-    except (TypeError, ValueError):
-        appointment_id = None
-    result = booking.cancel(phone, appointment_id)
-    _log(flow_manager, "tool", name="cancel_appointment", **result)
-    return result, None
-
-
-CANCEL_TOOL = FlowsFunctionSchema(
-    name="cancel_appointment",
-    description=(
-        "Cancel an appointment. Confirm with the caller before calling this. If "
-        "the caller has more than one upcoming appointment, call "
-        "list_appointments first and pass the right appointment_id; without an "
-        "id this cancels their soonest appointment."
-    ),
-    properties={
-        "phone_number": {"type": "string", "description": "Caller's phone number."},
-        "appointment_id": {
-            "type": "integer",
-            "description": "The id from list_appointments, when the caller has several.",
-        },
-    },
-    required=["phone_number"],
-    handler=cancel_appointment,
-)
-
-
-# ---------------------------------------------------------------------------
-# Escalation: take a message, create a real ticket.
+# Escalation: take a message, create a real HR callback ticket.
 # ---------------------------------------------------------------------------
 async def create_ticket(args: FlowArgs, flow_manager: FlowManager):
     voices = flow_manager.state.get("voices")
+    employee = flow_manager.state.get("employee") or {}
+    name = args.get("employee_name") or employee.get("employee_name", "")
     result = booking.create_ticket(
         summary=str(args.get("summary", "")),
         phone=str(args.get("phone_number") or flow_manager.state.get("phone", "")),
-        customer_name=str(args.get("customer_name", "")),
+        customer_name=str(name),
         urgency=str(args.get("urgency", "normal")),
         language=voices.language if voices else "en",
     )
@@ -343,22 +226,22 @@ async def create_ticket(args: FlowArgs, flow_manager: FlowManager):
         "ticket_created": True,
         "ticket_number": result["ticket_id"],
         "urgency": result["urgency"],
-        "note": "Tell the caller their ticket number and that the team will call back within one business day.",
+        "note": "Tell the caller their ticket number and that HR will call back within one business day.",
     }, None
 
 
 CREATE_TICKET_TOOL = FlowsFunctionSchema(
     name="create_ticket",
     description=(
-        "File a callback ticket for a human team member. Call this once you have "
-        "the caller's name, phone number, and a one-sentence summary of the issue."
+        "File a callback ticket for a human HR representative. Call this once you "
+        "have the caller's name, a callback number, and a one-sentence summary."
     ),
     properties={
-        "customer_name": {"type": "string", "description": "Caller's name."},
+        "employee_name": {"type": "string", "description": "Caller's name."},
         "phone_number": {"type": "string", "description": "Best callback number."},
         "summary": {
             "type": "string",
-            "description": "One-sentence summary of the issue for the human team.",
+            "description": "One-sentence summary of the issue for the HR team.",
         },
         "urgency": {
             "type": "string",
@@ -366,14 +249,13 @@ CREATE_TICKET_TOOL = FlowsFunctionSchema(
             "description": "How urgent the follow-up is.",
         },
     },
-    required=["customer_name", "phone_number", "summary"],
+    required=["employee_name", "phone_number", "summary"],
     handler=create_ticket,
 )
 
 
 # ---------------------------------------------------------------------------
-# Transfers: switch the department voice, greet in the caller's language,
-# then hand the conversation to the department node.
+# Logging + transfer helpers.
 # ---------------------------------------------------------------------------
 def _log(flow_manager: FlowManager, event_type: str, **data) -> None:
     log = flow_manager.state.get("log")
@@ -398,14 +280,13 @@ async def _switch_voice_and_greet(
             voice=voices.voice_map.get((department, language), "?"),
         )
 
-    # Once we know who's calling, stop asking for the phone number on every
-    # transfer — greet them (by name when we have it) and get on with it.
-    customer = flow_manager.state.get("customer") or {}
-    known = bool(customer.get("found") or flow_manager.state.get("phone"))
+    # Once we know who's calling, greet by name and don't re-ask for their ID.
+    employee = flow_manager.state.get("employee") or {}
+    known = bool(employee.get("found") or flow_manager.state.get("phone"))
     variant = f"{language}_known" if known else language
     greeting = GREETINGS.get(greeting_key, {}).get(variant)
     if greeting:
-        first_name = str(customer.get("customer_name", "")).split(" ")[0]
+        first_name = str(employee.get("employee_name", "")).split(" ")[0]
         name = f", {first_name}" if first_name else ""
         greeting = greeting.format(name=name)
         frames.append(TTSSpeakFrame(greeting))
@@ -417,9 +298,8 @@ def _make_transfer(department: str, node_factory, greeting_key: str | None = Non
     greeting_key = greeting_key or department
 
     # The voice switch + greeting run as a "function" pre-action on the new
-    # node rather than directly in this handler: a function action executes
-    # only when the pipeline has drained everything queued before it, so the
-    # new voice can never overlap audio the old voice is still speaking.
+    # node so they execute only after in-flight audio has drained — the new
+    # voice can never overlap the previous one.
     async def switch_and_greet(action: dict, flow_manager: FlowManager) -> None:
         await _switch_voice_and_greet(flow_manager, department, greeting_key)
 
@@ -440,31 +320,37 @@ def _transfer_tool(name: str, description: str, handler) -> FlowsFunctionSchema:
     )
 
 
-# Defined below the node factories they reference (resolved at call time).
-ROUTE_BILLING = _transfer_tool(
-    "route_to_billing",
-    "Transfer the caller to billing: invoices, payments, refunds, charges, "
-    "balances, or pricing on a past job.",
-    _make_transfer("billing", lambda: create_billing_node()),
+ROUTE_LEAVE = _transfer_tool(
+    "route_to_leave",
+    "Transfer to the leave and time-off team: PTO, vacation, compensatory off, "
+    "overtime, working hours, holidays, and attendance.",
+    _make_transfer("leave", lambda: create_leave_node()),
 )
-ROUTE_SCHEDULING = _transfer_tool(
-    "route_to_scheduling",
-    "Transfer the caller to scheduling: booking, rescheduling, or canceling a "
-    "technician visit.",
-    _make_transfer("scheduling", lambda: create_scheduling_node()),
+ROUTE_CONDUCT = _transfer_tool(
+    "route_to_conduct",
+    "Transfer to conduct and ethics: code of conduct, gifts and entertainment, "
+    "anti-bribery, harassment, conflicts of interest, and ethical behavior.",
+    _make_transfer("conduct", lambda: create_conduct_node()),
 )
-ROUTE_CS = _transfer_tool(
-    "route_to_customer_service",
-    "Transfer the caller to customer service: problems, complaints, follow-ups, "
-    "bad experiences, or general questions.",
-    _make_transfer("customer_service", lambda: create_cs_node()),
+ROUTE_COMPLIANCE = _transfer_tool(
+    "route_to_compliance",
+    "Transfer to compliance and reporting: how to report a violation, "
+    "disciplinary processes, investigations, and consequences for breaking policy.",
+    _make_transfer("compliance", lambda: create_compliance_node()),
+)
+ROUTE_GENERAL = _transfer_tool(
+    "route_to_general",
+    "Transfer to general HR: how policies are reviewed, updated, or communicated, "
+    "and any HR policy question that doesn't fit the other teams.",
+    _make_transfer("general", lambda: create_general_node()),
 )
 ROUTE_HUMAN = _transfer_tool(
     "route_to_human",
-    "Use when the caller asks for a human or supervisor, is upset, or you cannot "
-    "help after two attempts. Takes a message for a human callback.",
+    "Use when the caller asks for a human, is upset, raises a personal dispute or "
+    "complaint about a specific person, or you can't help after two attempts. "
+    "Takes a message for a human HR callback.",
     _make_transfer(
-        "customer_service", lambda: create_escalation_node(), greeting_key="escalation"
+        "general", lambda: create_escalation_node(), greeting_key="escalation"
     ),
 )
 
@@ -476,190 +362,143 @@ async def _end_call(args: FlowArgs, flow_manager: FlowManager):
 
 END_CALL = _transfer_tool(
     "end_call",
-    "End the call politely. Use only when the caller says they are done and has "
-    "no other questions.",
+    "End the call politely. Use only when the caller says they're done and has no "
+    "other questions.",
     _end_call,
 )
 
 GLOBAL_FUNCTIONS = [ROUTE_HUMAN, END_CALL]
 
+# Every department can hand off to any sibling department.
+_SIBLING_ROUTES = {
+    "leave": [ROUTE_CONDUCT, ROUTE_COMPLIANCE, ROUTE_GENERAL],
+    "conduct": [ROUTE_LEAVE, ROUTE_COMPLIANCE, ROUTE_GENERAL],
+    "compliance": [ROUTE_LEAVE, ROUTE_CONDUCT, ROUTE_GENERAL],
+    "general": [ROUTE_LEAVE, ROUTE_CONDUCT, ROUTE_COMPLIANCE],
+}
 
-def _rag_tools() -> list:
-    return [SEARCH_KB_TOOL] if SEARCH_KB_TOOL else []
+
+def _department_functions(department: str) -> list:
+    """Lookup + this department's own scoped KB search + sibling transfers."""
+    tools = [LOOKUP_TOOL]
+    search = make_search_tool(department)
+    if search:
+        tools.append(search)
+    tools.extend(_SIBLING_ROUTES[department])
+    return tools
+
+
+_DEPARTMENT_TASK = (
+    "If this conversation does not already contain the caller's record, they "
+    "were just asked for their employee ID or phone number — once you have it, "
+    "call lookup_employee (once per call). If their record is already here, do "
+    "NOT ask again. For any specific policy question, call search_knowledge_base "
+    "and answer ONLY from what it returns — never guess a rule, number, or "
+    "deadline. If it finds nothing, say an HR specialist will follow up. If the "
+    "caller's question belongs to another team, call the matching transfer "
+    "function without announcing it — that team greets them itself."
+)
 
 
 # ---------------------------------------------------------------------------
-# Nodes.
+# Department nodes.
 # ---------------------------------------------------------------------------
 def create_router_node() -> NodeConfig:
     return {
         "name": "router",
         "role_message": (
-            f"You are the virtual receptionist for {COMPANY_NAME}, a home services "
-            f"company. You are the first person every caller reaches. {VOICE_STYLE}"
+            f"You are the virtual HR receptionist for {COMPANY_NAME}. You are the "
+            f"first person every employee reaches when they call HR. {VOICE_STYLE}"
         ),
         "task_messages": [
             {
                 "role": "system",
                 "content": (
                     "The caller has already been greeted. Based on what they say, "
-                    "decide which department they need and call the matching "
-                    "transfer function immediately, WITHOUT saying anything first — "
-                    "the department announces itself when the transfer lands. "
-                    "Billing covers invoices, payments, refunds, charges, balances, "
-                    "and pricing on a past job. Scheduling covers booking, "
-                    "rescheduling, canceling, appointments, and technician visits. "
-                    "Customer service covers problems, complaints, follow-ups, bad "
-                    "experiences, and general questions. If it's unclear, ask one "
-                    "quick question; if it's still unclear, use customer service. "
-                    "Don't try to solve the request yourself. If the caller speaks "
-                    "Spanish, reply in Spanish."
+                    "decide which HR team they need and call the matching transfer "
+                    "function immediately, WITHOUT saying anything first — the team "
+                    "announces itself when the transfer lands. Leave & time-off: "
+                    "PTO, vacation, compensatory off, overtime, working hours, "
+                    "attendance. Conduct & ethics: code of conduct, gifts, "
+                    "anti-bribery, harassment, conflicts of interest. Compliance & "
+                    "reporting: reporting a violation, disciplinary action, "
+                    "investigations, consequences. General HR: how policies are "
+                    "reviewed or communicated, and anything else. If it's unclear, "
+                    "ask one quick question; if still unclear, use general HR. "
+                    "Don't try to answer the question yourself."
                 ),
             }
         ],
-        "functions": [ROUTE_BILLING, ROUTE_SCHEDULING, ROUTE_CS],
+        "functions": [ROUTE_LEAVE, ROUTE_CONDUCT, ROUTE_COMPLIANCE, ROUTE_GENERAL],
         "respond_immediately": False,
     }
 
 
-def create_billing_node() -> NodeConfig:
+def _department_node(name: str, persona: str) -> NodeConfig:
     return {
-        "name": "billing",
-        "role_message": (
-            f"You are a billing specialist at {COMPANY_NAME}. You help callers "
-            f"understand charges, invoices, payments, and balances. You sound calm, "
-            f"professional, and clear. {VOICE_STYLE}"
-        ),
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "If this conversation does not already contain the caller's "
-                    "account record, they were just asked for their phone number — "
-                    "once you have it, call lookup_customer (once per call). If "
-                    "their record is already in the conversation from an earlier "
-                    "lookup, do NOT ask again. Use their name "
-                    "and history naturally. Only state amounts, dates, or charges "
-                    "you actually find in their record or the knowledge base; if "
-                    "you don't have a detail, say you'll look into it rather than "
-                    "guessing. Never invent prices or promise refunds — refund "
-                    "requests go to route_to_human. If the caller needs scheduling "
-                    "or has a service problem, call the matching transfer function "
-                    "without announcing it — the department greets them itself."
-                ),
-            }
-        ],
-        "functions": [LOOKUP_TOOL, ROUTE_SCHEDULING, ROUTE_CS] + _rag_tools(),
+        "name": name,
+        "role_message": f"{persona} {VOICE_STYLE}",
+        "task_messages": [{"role": "system", "content": _DEPARTMENT_TASK}],
+        "functions": _department_functions(name),
         "respond_immediately": False,
     }
 
 
-def create_scheduling_node() -> NodeConfig:
-    return {
-        "name": "scheduling",
-        "role_message": (
-            f"You are a scheduling coordinator at {COMPANY_NAME}. You help callers "
-            f"book, reschedule, or cancel technician visits. You are warm, upbeat, "
-            f"and efficient. {VOICE_STYLE}"
-        ),
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    f"Today is {datetime.now():%A, %B %d, %Y} "
-                    f"({datetime.now():%Y-%m-%d}). "
-                    "If this conversation does not already contain the caller's "
-                    "account record, they were just asked for their phone number — "
-                    "once you have it, call lookup_customer (once per call). If "
-                    "their record is already there, do NOT ask again. To book: call "
-                    "check_availability and offer two or three of the returned "
-                    "times conversationally — never offer a time it didn't return. "
-                    "Before booking, read the full details back (day, time, "
-                    "service) and get an explicit yes; only then call "
-                    "book_appointment, and confirm using what it returns. To "
-                    "reschedule or cancel: call list_appointments first; if there "
-                    "is more than one, confirm which and pass its appointment_id "
-                    "to cancel_appointment; for a reschedule, then book the new "
-                    "time the same careful way. If a booking fails, offer the "
-                    "alternatives it returns. If the caller needs billing or has a "
-                    "complaint, call the matching transfer function without "
-                    "announcing it — the department greets them itself."
-                ),
-            }
-        ],
-        "functions": [
-            LOOKUP_TOOL,
-            CHECK_AVAILABILITY_TOOL,
-            BOOK_TOOL,
-            LIST_APPOINTMENTS_TOOL,
-            CANCEL_TOOL,
-            ROUTE_BILLING,
-            ROUTE_CS,
-        ]
-        + _rag_tools(),
-        "respond_immediately": False,
-    }
+def create_leave_node() -> NodeConfig:
+    return _department_node(
+        "leave",
+        f"You are a leave and time-off specialist at {COMPANY_NAME}. You help "
+        "employees understand PTO, vacation, compensatory off, overtime, working "
+        "hours, and attendance policy. You are warm and clear.",
+    )
 
 
-def create_cs_node() -> NodeConfig:
-    return {
-        "name": "customer_service",
-        "role_message": (
-            f"You are a customer care specialist at {COMPANY_NAME}. You handle "
-            f"general questions, complaints, and follow-up support. You are "
-            f"empathetic, calm, and helpful, and you acknowledge how the caller "
-            f"feels before jumping to solutions. {VOICE_STYLE}"
-        ),
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "If this conversation does not already contain the caller's "
-                    "account record, they were just asked for their phone number — "
-                    "once you have it, call lookup_customer (once per call). If "
-                    "their record is already there, do NOT ask again. Pay "
-                    "attention to their service history and last call notes. Get a "
-                    "brief, clear picture of the issue with a short follow-up "
-                    "question if needed. For complaints, acknowledge and apologize "
-                    "before next steps. "
-                    + (
-                        "Use search_knowledge_base to answer policy or service "
-                        "questions. "
-                        if SEARCH_KB_TOOL
-                        else "For policy questions you can't answer from the "
-                        "caller's record, say a team member will follow up. "
-                    )
-                    + "Don't promise refunds, credits, or outcomes you can't "
-                    "confirm — those go to route_to_human, which files a callback "
-                    "ticket. If the caller needs billing or to schedule a visit, "
-                    "call the matching transfer function without announcing it — "
-                    "the department greets them itself."
-                ),
-            }
-        ],
-        "functions": [LOOKUP_TOOL, ROUTE_BILLING, ROUTE_SCHEDULING] + _rag_tools(),
-        "respond_immediately": False,
-    }
+def create_conduct_node() -> NodeConfig:
+    return _department_node(
+        "conduct",
+        f"You are a workplace conduct and ethics specialist at {COMPANY_NAME}. "
+        "You explain the code of conduct, gifts and entertainment rules, "
+        "anti-bribery policy, harassment policy, and conflicts of interest. You "
+        "are professional and even-handed.",
+    )
+
+
+def create_compliance_node() -> NodeConfig:
+    return _department_node(
+        "compliance",
+        f"You are a compliance and reporting specialist at {COMPANY_NAME}. You "
+        "explain how to report a concern, what disciplinary processes look like, "
+        "and the consequences of policy violations. You are calm, precise, and "
+        "non-judgmental.",
+    )
+
+
+def create_general_node() -> NodeConfig:
+    return _department_node(
+        "general",
+        f"You are a general HR specialist at {COMPANY_NAME}. You handle questions "
+        "about how policies are reviewed, updated, and communicated, and any HR "
+        "policy question that doesn't fit another team. You are friendly and helpful.",
+    )
 
 
 def create_escalation_node() -> NodeConfig:
     return {
         "name": "escalation",
         "role_message": (
-            f"You take messages for the human team at {COMPANY_NAME}. You are "
+            f"You take messages for the human HR team at {COMPANY_NAME}. You are "
             f"patient and reassuring. {VOICE_STYLE}"
         ),
         "task_messages": [
             {
                 "role": "system",
                 "content": (
-                    "The caller has just been told you'll take their details for a "
-                    "human callback. Collect three things, one at a time if needed: "
+                    "The caller has just been told you'll take their details for an "
+                    "HR callback. Collect three things, one at a time if needed: "
                     "their name, the best callback number, and a one-sentence "
                     "summary of the issue. Then call create_ticket, tell them their "
-                    "ticket number, and say a team member will call back within one "
-                    "business day. Don't argue, don't promise outcomes. When "
-                    "they're done, use end_call."
+                    "ticket number, and say HR will call back within one business "
+                    "day. Don't argue or promise outcomes. When done, use end_call."
                 ),
             }
         ],

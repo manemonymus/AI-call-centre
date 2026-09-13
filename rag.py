@@ -1,13 +1,20 @@
 """
-Knowledge-base search using ChromaDB and Ollama embeddings.
+Per-department knowledge-base search (ChromaDB + Ollama embeddings).
+
+Each HR department has its OWN ChromaDB collection (hr_leave, hr_conduct,
+hr_compliance, hr_general), so a department only ever retrieves its own
+documents — "each department trained on its own data." make_search_tool(dept)
+returns a Pipecat Flows tool bound to one department's collection; each
+department node gets its own instance.
 
 Setup (one time):
     ollama pull nomic-embed-text
     pip install chromadb
-    python ingest.py                     # loads home_services_faq.csv
-    python ingest.py my_kaggle_data.csv  # or any CSV with question/answer columns
+    python fetch_hr_data.py     # builds hr_faq.csv from a real HR dataset
+    python ingest.py            # loads it into per-department collections
 
-The SEARCH_KB_TOOL can then be added to any FlowManager node.
+Embeddings run locally via Ollama (free); this is independent of whichever
+chat LLM / STT you choose, but Ollama must be running for RAG to work.
 """
 
 from __future__ import annotations
@@ -23,27 +30,41 @@ from pipecat_flows import FlowArgs, FlowManager, FlowsFunctionSchema
 # ---------------------------------------------------------------------------
 EMBED_MODEL = "nomic-embed-text"   # pull with: ollama pull nomic-embed-text
 OLLAMA_URL = "http://localhost:11434"
-COLLECTION_NAME = "home_services_kb"
 DB_PATH = "./chroma_db"            # created in the project directory
+COLLECTION_PREFIX = "hr_"
+
+DEPARTMENTS = ("leave", "conduct", "compliance", "general")
+
+# Human-readable label per department, used in tool descriptions.
+DEPARTMENT_LABEL = {
+    "leave": "leave, time-off, PTO, compensatory off, overtime, and attendance",
+    "conduct": "code of conduct, gifts, anti-bribery, harassment, and ethics",
+    "compliance": "reporting violations, disciplinary action, and compliance",
+    "general": "general HR policy, how policies are reviewed, updated, and communicated",
+}
+
+
+def collection_name(department: str) -> str:
+    return f"{COLLECTION_PREFIX}{department}"
 
 
 # ---------------------------------------------------------------------------
 # Vector store helpers
 # ---------------------------------------------------------------------------
-def _get_collection() -> chromadb.Collection:
+def get_collection(department: str) -> chromadb.Collection:
     client = chromadb.PersistentClient(path=DB_PATH)
     ef = OllamaEmbeddingFunction(url=OLLAMA_URL, model_name=EMBED_MODEL)
     return client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=collection_name(department),
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
 
 
-def search_kb(query: str, n_results: int = 3) -> list[dict]:
-    """Return the top-k most relevant chunks for the query."""
+def search_kb(query: str, department: str, n_results: int = 3) -> list[dict]:
+    """Top-k most relevant chunks for the query, from ONE department's collection."""
     try:
-        collection = _get_collection()
+        collection = get_collection(department)
         if collection.count() == 0:
             return []
         results = collection.query(
@@ -52,52 +73,53 @@ def search_kb(query: str, n_results: int = 3) -> list[dict]:
         )
         docs = []
         for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            docs.append({"content": doc, "category": meta.get("category", "")})
+            docs.append({"content": doc, "category": meta.get("department", department)})
         return docs
     except Exception as e:
-        logger.warning(f"Knowledge base search failed: {e}")
+        logger.warning(f"KB search failed for '{department}': {e}")
         return []
 
 
 # ---------------------------------------------------------------------------
-# Pipecat Flows tool handler
+# Pipecat Flows tool factory — one tool per department.
 # ---------------------------------------------------------------------------
-async def _search_handler(args: FlowArgs, flow_manager: FlowManager):
-    query = str(args.get("query", "")).strip()
-    if not query:
-        return {"found": False, "note": "Empty query."}, None
+def make_search_tool(department: str) -> FlowsFunctionSchema:
+    """Build a search_knowledge_base tool scoped to a single department's KB."""
 
-    results = search_kb(query)
-    if not results:
-        return {
-            "found": False,
-            "note": "No relevant information found in the knowledge base.",
-        }, None
+    async def _search_handler(args: FlowArgs, flow_manager: FlowManager):
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"found": False, "note": "Empty query."}, None
 
-    context = "\n\n".join(
-        f"[{r['category'].title() or 'Info'}] {r['content']}" for r in results
+        results = search_kb(query, department)
+        log = flow_manager.state.get("log")
+        if log:
+            log.event("kb_search", department=department, query=query, hits=len(results))
+
+        if not results:
+            return {
+                "found": False,
+                "note": "Nothing in this department's knowledge base covers that.",
+            }, None
+
+        context = "\n\n".join(f"- {r['content']}" for r in results)
+        logger.info(f"KB[{department}] '{query}' → {len(results)} result(s)")
+        return {"found": True, "context": context}, None
+
+    return FlowsFunctionSchema(
+        name="search_knowledge_base",
+        description=(
+            f"Search the {department} knowledge base, which covers "
+            f"{DEPARTMENT_LABEL.get(department, department)}. Use this whenever the "
+            "caller asks a specific question — answer ONLY from what it returns, "
+            "and never invent policies, numbers, or rules it doesn't contain."
+        ),
+        properties={
+            "query": {
+                "type": "string",
+                "description": "A concise search query describing what the caller wants to know.",
+            }
+        },
+        required=["query"],
+        handler=_search_handler,
     )
-    logger.info(f"KB search '{query}' → {len(results)} result(s)")
-    return {"found": True, "context": context}, None
-
-
-SEARCH_KB_TOOL = FlowsFunctionSchema(
-    name="search_knowledge_base",
-    description=(
-        "Search the company knowledge base for information about services, "
-        "pricing, policies, warranties, scheduling, or any FAQ the caller asks "
-        "about. Use this whenever the caller asks a specific question you don't "
-        "know the answer to from memory."
-    ),
-    properties={
-        "query": {
-            "type": "string",
-            "description": (
-                "A concise search query describing what the caller wants to know, "
-                "e.g. 'HVAC tune-up cost' or 'cancellation policy'."
-            ),
-        }
-    },
-    required=["query"],
-    handler=_search_handler,
-)
