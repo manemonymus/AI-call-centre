@@ -1,18 +1,22 @@
 # AI HR Helpline — Pipecat + Pipecat Flows
 
-A multi-agent AI **HR help line** for employees that runs **entirely free on
-your machine** — no cloud APIs, no keys — with a **pluggable architecture** where each component (speech-to-text, LLM, text-to-speech) can be swapped between free local models (Whisper, Ollama, Piper) and production cloud services (Deepgram, Claude, Cartesia) via environment variables. See `PLAN.md` for the full production roadmap and cost breakdown.
+A multi-agent AI **HR help line** for employees with a **pluggable architecture**
+where each component (STT, LLM, TTS) can be swapped between free local models 
+(Whisper, Ollama, Piper) and production cloud services via environment variables.
+
+**Current stack (recommended):** Deepgram (multilingual STT) + Claude Haiku 4.5 (LLM) + 
+Piper (local TTS) — ~$0.05/min, <1.5s latency, per-department voices.
 
 ```
   Microphone / speakers   ->  LocalAudioTransport   (bot.py)
   Real phone calls        ->  Twilio Media Streams  (server.py)
-  Speech-to-text          ->  Whisper (faster-whisper), local —
-                              auto-detects English vs Spanish per utterance
-  LLM brains              ->  a local model served by Ollama
-  Text-to-speech          ->  Piper, local — a DIFFERENT voice per
-                              department, with Spanish voices when the
-                              caller speaks Spanish
+  Speech-to-text          ->  Deepgram Nova-3 (streaming, multilingual)
+  LLM brains              ->  Claude Haiku 4.5 (fast, strong tool-calling)
+  Text-to-speech          ->  Piper (local) — distinct voice per department
 ```
+
+**Optional free local stack (dev/testing only):** Whisper + Ollama + Piper 
+(runs entirely offline, ~5–10s latency per turn)
 
 Employees call in; a receptionist routes them to one of four HR teams, each
 with its **own AI voice** and its **own knowledge base** (per-department RAG):
@@ -134,34 +138,42 @@ environment variable.
 
 **1. Python 3.10+**
 
-**2. Two system libraries** (Pipecat's mic input and Piper's speech need them):
+**2. API keys for the recommended stack:**
+
+- `DEEPGRAM_API_KEY` from <https://console.deepgram.com> (free $200 credit on signup, multilingual STT)
+- `ANTHROPIC_API_KEY` from <https://console.anthropic.com> (Claude Haiku 4.5 LLM)
+
+**3. Two system libraries** (Pipecat's mic input and Piper TTS need them):
 
 - macOS: `brew install portaudio espeak-ng`
 - Debian/Ubuntu: `sudo apt-get install portaudio19-dev espeak-ng`
 - Windows: included with the pip packages — nothing to install.
 
-**3. Ollama**, with a tool-calling model pulled. Install it from
-<https://ollama.com>, then:
+**Optional: Ollama** (only for free local dev stack, skips API costs but trades speed):
 
 ```bash
-ollama pull qwen2.5      # or: llama3.1, mistral-nemo — must support tools
-ollama pull nomic-embed-text   # for the RAG knowledge base
+ollama pull qwen2.5                # LLM (tool-capable model)
+ollama pull nomic-embed-text       # embeddings for RAG
 ```
-
-Make sure Ollama is running (`ollama serve`, or just launch the app).
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-python fetch_hr_data.py   # download + classify the real HR dataset -> hr_faq.csv
-python ingest.py          # load it into per-department ChromaDB collections
+cp .env.example .env           # copy template
+# Edit .env and add your API keys:
+#   DEEPGRAM_API_KEY=<your key>
+#   ANTHROPIC_API_KEY=<your key>
+python fetch_hr_data.py        # download + classify HR Q&A dataset
+python ingest.py               # load into per-department ChromaDB collections
 ```
 
-`fetch_hr_data.py` uses whatever LLM is available to classify each Q&A into a
-department (Claude if `ANTHROPIC_API_KEY` is set, else local Ollama, else a
-keyword fallback). `ingest.py` needs Ollama running with `nomic-embed-text` for
-embeddings (free, local) regardless of which chat model you use.
+`fetch_hr_data.py` uses Claude (if `ANTHROPIC_API_KEY` is set) to classify Q&As
+into departments, falling back to Ollama or keyword matching if needed.
+
+`ingest.py` uses Ollama's `nomic-embed-text` for embeddings (free, local, 
+doesn't require API keys). If you're using the free local LLM stack only, 
+Ollama is required; otherwise optional.
 
 ## Run (microphone demo)
 
@@ -169,29 +181,26 @@ embeddings (free, local) regardless of which chat model you use.
 python bot.py
 ```
 
-The **first run downloads** the Whisper model and six Piper voices (~400 MB
-total, one time). After that, the assistant greets you and you can start
-talking — in English or Spanish. Press **Ctrl+C** to quit.
+The assistant greets you and you can start talking — in English or Spanish.
+Press **Ctrl+C** to quit.
 
-## Upgrade the ears + brain (Deepgram + Claude)
+**First run:** downloads Piper voices (~400 MB, one time). With Deepgram + Claude,
+responses come back in ~1–1.5s. With the free local stack (Whisper + Ollama), 
+expect ~5–10s per turn.
 
-The free local stack trades accuracy and speed for $0. When Whisper mishears
-you or Ollama takes 10+ seconds to answer, switch to the hosted stack — same
-code, two API keys:
+## Switch to the free local stack (optional)
+
+To run entirely offline without API keys, edit `.env`:
 
 ```bash
-cp .env.example .env     # then edit .env:
-#   STT_PROVIDER=deepgram   + DEEPGRAM_API_KEY   (console.deepgram.com — free credit on signup)
-#   LLM_PROVIDER=anthropic  + ANTHROPIC_API_KEY  (console.anthropic.com)
+STT_PROVIDER=whisper        # local Whisper instead of Deepgram
+LLM_PROVIDER=ollama         # local Ollama instead of Claude
+# Make sure Ollama is running: ollama serve
 python bot.py
 ```
 
-What it buys: phone-grade streaming transcription with proper Spanish
-code-switching (Deepgram Nova-3 multilingual, ~$0.006/min), ~1s responses and
-far more reliable routing/RAG tool calls (Claude Haiku 4.5,
-~$0.005–0.015/min). Caller audio is kept out of Deepgram's training data by
-default (`DEEPGRAM_MIP_OPT_OUT=true`). TTS stays on free local Piper either
-way; mix and match providers freely.
+Trade-off: ~5–10s latency per turn, runs on CPU only, handles 1–2 concurrent calls.
+Good for development and testing.
 
 ## Run (real phone number via Twilio)
 
@@ -243,10 +252,10 @@ that team's own knowledge base):
 | Variable | Default | Purpose |
 |---|---|---|
 | `COMPANY_NAME` | Hearthstone | Used throughout the scripts (and to fix the dataset's placeholder company) |
-| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `anthropic` \| `google` |
-| `OLLAMA_MODEL` | `qwen2.5` | Any tool-capable Ollama model |
-| `STT_PROVIDER` | `whisper` | `whisper` (local) \| `deepgram` (cloud, multilingual) |
-| `WHISPER_MODEL` | `small` | tiny/base/small/medium — bigger = more accurate |
+| `STT_PROVIDER` | `deepgram` | `deepgram` (cloud, multilingual) \| `whisper` (local, slower) |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` (Claude) \| `ollama` (local, slower) \| `openai` \| `google` |
+| `WHISPER_MODEL` | `small` | (only if `STT_PROVIDER=whisper`) tiny/base/small/medium — bigger = more accurate |
+| `OLLAMA_MODEL` | `qwen2.5` | (only if `LLM_PROVIDER=ollama`) Any tool-capable Ollama model |
 | `LANG_CONFIDENCE` | `0.7` | Min confidence before a language switch |
 | `VOICE_<DEPT>_<LANG>` | see `services.py` | dept = `ROUTER`/`LEAVE`/`CONDUCT`/`COMPLIANCE`/`GENERAL`, e.g. `VOICE_LEAVE_EN=en_US-amy-medium` |
 | `ENABLE_RAG` | `true` | Per-department knowledge-base lookups on/off |
