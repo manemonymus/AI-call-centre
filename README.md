@@ -1,9 +1,7 @@
 # AI HR Helpline — Pipecat + Pipecat Flows
 
 A multi-agent AI **HR help line** for employees that runs **entirely free on
-your machine** — no cloud APIs, no keys — and is wired so each component can be
-flipped to a production cloud service with an environment variable (see
-`PLAN.md` for the full production roadmap).
+your machine** — no cloud APIs, no keys — with a **pluggable architecture** where each component (speech-to-text, LLM, text-to-speech) can be swapped between free local models (Whisper, Ollama, Piper) and production cloud services (Deepgram, Claude, Cartesia) via environment variables. See `PLAN.md` for the full production roadmap and cost breakdown.
 
 ```
   Microphone / speakers   ->  LocalAudioTransport   (bot.py)
@@ -58,25 +56,59 @@ legal disclosure in Spanish, once).
 
 ---
 
+## Architecture: Cascaded Pipeline (not speech-to-speech)
+
+This system uses a **cascaded STT → LLM → TTS pipeline** rather than a
+speech-to-speech model. Why?
+
+- **Per-department voices mid-call**: Speech-to-speech APIs (OpenAI Realtime,
+  Gemini Live) lock the voice at session start and can't change it mid-call.
+  Here, each department has its own voice identity, and transfers flip the voice
+  instantly.
+- **Deterministic routing & RAG**: The LLM is a deterministic agent (Claude with
+  function calls, or Ollama with tools), not a `<generalist audio model>`. This
+  keeps your control over what knowledge base is searched, what transfers are
+  allowed, and what fallbacks fire.
+- **Cost**: Cascaded pipeline at ~$0.05/min (production stack) vs. speech-to-speech at $0.18–0.46/min (OpenAI Realtime is 10–50x pricier).
+
+**Local dev stack** (free) runs on your machine:
+
+```
+Whisper (faster-whisper)  ──>  Ollama (qwen2.5)  ──>  Piper (local voices)
+     ~5-10s latency              ~5-10s per turn         ~200ms
+```
+
+**Production stack** (low-cost cloud) has <1.5s end-to-end latency:
+
+```
+Deepgram (streaming)  ──>  Claude Haiku 4.5  ──>  Cartesia Sonic 3.5
+  ~600ms                    ~600–900ms              ~100ms
+```
+
+Both stacks share the same Python agent code, routing logic, and RAG
+(`services.py` abstracts the provider swap).
+
+---
+
 ## Tech stack
 
 Python voice-AI app built on **Pipecat**, with every heavy component
 swappable between a free local model and a hosted cloud service via an
 environment variable.
 
-| Layer | Technology |
-|---|---|
-| Voice pipeline | **Pipecat** (`pipecat-ai` 1.3.0) |
-| Multi-agent flow | **Pipecat Flows** (`pipecat-ai-flows` 1.2.0) — router → departments, transfers, escalation |
-| Speech-to-text | **Deepgram Nova-3** (multilingual, streaming) *· or* local **faster-whisper** |
-| LLM | **Anthropic Claude Haiku 4.5** *· or* local **Ollama** (qwen2.5) — OpenAI & Gemini also wired |
-| Text-to-speech | **Piper** (local) — one voice per department per language via `ServiceSwitcher` |
-| RAG | **ChromaDB** (one collection per department) + **Ollama `nomic-embed-text`** embeddings |
-| Knowledge data | real HR Q&A from **Hugging Face** (`strova-ai/hr-policies-qa-dataset`), LLM-classified |
-| Telephony | **Twilio** Media Streams + **FastAPI**/**Uvicorn** (`server.py`); **ngrok** for dev |
-| Turn-taking | **Silero VAD** |
-| Storage | **SQLite** (callback tickets) · **JSONL** (per-call logs + transcripts) |
-| Config / logging | **python-dotenv** · **loguru** |
+| Layer | Free (local) | Production (cloud) | Shared |
+|---|---|---|---|
+| Voice pipeline | — | — | **Pipecat** 1.3.0 + **Pipecat Flows** 1.2.0 |
+| Speech-to-text | **faster-whisper** (CPU, ~5s) | **Deepgram Nova-3** (~600ms) | swappable via `STT_PROVIDER` |
+| LLM | **Ollama qwen2.5** (~5s/turn) | **Claude Haiku 4.5** (~600ms) | swappable via `LLM_PROVIDER`; tool-calling routing |
+| Text-to-speech | **Piper** (local, ~200ms) | **Cartesia Sonic 3.5** (~100ms) | per-department voices via `ServiceSwitcher` |
+| RAG | **ChromaDB** (one collection per dept) + **Ollama `nomic-embed-text`** |  | same across both stacks |
+| Knowledge data | real HR Q&A from **Hugging Face**, LLM-classified into 4 departments |  | same across both stacks |
+| Telephony | — | **Twilio** Media Streams | **FastAPI**/**Uvicorn** (`server.py`); **ngrok** for dev tunneling |
+| Turn-taking | **Silero VAD** |  | shared |
+| Storage | **SQLite** + **JSONL** transcripts |  | shared |
+| Config | **python-dotenv** |  | per-stack secrets in `.env` |
+| Logging | **loguru** |  | per-call event logs in `call_logs/` |
 
 **Data flow of a single call:**
 
